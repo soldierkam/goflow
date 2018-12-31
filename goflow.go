@@ -4,24 +4,26 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net"
+	"os"
+	"runtime"
+	"sort"
+	"strconv"
+	"sync"
+	"time"
+
 	log "github.com/Sirupsen/logrus"
+	"github.com/allegro/bigcache"
 	"github.com/cloudflare/goflow/decoders"
 	"github.com/cloudflare/goflow/decoders/netflow"
 	"github.com/cloudflare/goflow/decoders/sflow"
 	flowmessage "github.com/cloudflare/goflow/pb"
 	"github.com/cloudflare/goflow/producer"
-	"github.com/cloudflare/goflow/transport"
-	"net"
-	"os"
-	"runtime"
-	"strconv"
-	"strings"
-	"sync"
-	"time"
+
+	"net/http"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"net/http"
 
 	"encoding/json"
 
@@ -29,6 +31,41 @@ import (
 )
 
 const AppVersion = "GoFlow v2.0.7"
+
+// -- bool Value
+type networkValue net.IPNet
+
+func (n *networkValue) Set(s string) error {
+	_, network, err := net.ParseCIDR(s)
+	*n = (networkValue)(*network)
+	return err
+}
+
+func (n *networkValue) Get() interface{} { return *n }
+
+func (n *networkValue) String() string {
+	i := (*net.IPNet)(n)
+	return i.String()
+}
+
+func newNetworkValue(val *net.IPNet, p *net.IPNet) *networkValue {
+	*p = *val
+	return (*networkValue)(p)
+}
+
+func NetworkVar(f *flag.FlagSet, p *net.IPNet, name string, value *net.IPNet, usage string) {
+	f.Var(newNetworkValue(value, p), name, usage)
+}
+
+func Network(f *flag.FlagSet, name string, value string, usage string) *net.IPNet {
+	p := new(net.IPNet)
+	_, valueParsed, err := net.ParseCIDR(value)
+	if err != nil {
+		panic(fmt.Sprintf("Invalid network addr %s", value))
+	}
+	NetworkVar(f, p, name, valueParsed, usage)
+	return p
+}
 
 var (
 	FEnable = flag.Bool("netflow", true, "Enable NetFlow")
@@ -45,16 +82,10 @@ var (
 	LogLevel = flag.String("loglevel", "info", "Log level")
 	LogFmt   = flag.String("logfmt", "normal", "Log formatter")
 
-	EnableKafka  = flag.Bool("kafka", true, "Enable Kafka")
 	MetricsAddr  = flag.String("metrics.addr", ":8080", "Metrics address")
 	MetricsPath  = flag.String("metrics.path", "/metrics", "Metrics path")
 	TemplatePath = flag.String("templates.path", "/templates", "NetFlow/IPFIX templates list")
-
-	KafkaTLS   = flag.Bool("kafka.tls", false, "Use TLS to connect to Kafka")
-	KafkaSASL  = flag.Bool("kafka.sasl", false, "Use SASL/PLAIN data to connect to Kafka (TLS is recommended and the environment variables KAFKA_SASL_USER and KAFKA_SASL_PASS need to be set)")
-	KafkaTopic = flag.String("kafka.out.topic", "flow-messages", "Kafka topic to produce to")
-	KafkaSrv   = flag.String("kafka.out.srv", "", "SRV record containing a list of Kafka brokers (or use kafka.out.brokers)")
-	KafkaBrk   = flag.String("kafka.out.brokers", "127.0.0.1:9092,[::1]:9092", "Kafka brokers list separated by commas")
+	HostsNetwork = Network(flag.CommandLine, "hosts", "192.168.0.0/24", "Hosts to monitor")
 
 	Version = flag.Bool("v", false, "Print version")
 )
@@ -384,25 +415,66 @@ func (s *state) decodeNetFlow(msg interface{}) error {
 }
 
 func FlowMessageToString(fmsg *flowmessage.FlowMessage) string {
-	s := fmt.Sprintf("Type:%v TimeRecvd:%v SamplingRate:%v SequenceNum:%v TimeFlow:%v " +
-					"SrcIP:%v DstIP:%v IPversion:%v Bytes:%v Packets:%v RouterAddr:%v NextHop:%v NextHopAS:%v " +
-					"SrcAS:%v DstAS:%v SrcNet:%v DstNet:%v SrcIf:%v DstIf:%v Proto:%v " +
-					"SrcPort:%v DstPort:%v IPTos:%v ForwardingStatus:%v IPTTL:%v TCPFlags:%v " +
-					"SrcMac:%v DstMac:%v VlanId:%v Etype:%v IcmpType:%v IcmpCode:%v " +
-					"SrcVlan:%v DstVlan:%v IPv6FlowLabel:%v",
-		fmsg.Type, fmsg.TimeRecvd, fmsg.SamplingRate, fmsg.SequenceNum, fmsg.TimeFlow, 
-		net.IP(fmsg.SrcIP), net.IP(fmsg.DstIP), fmsg.IPversion, fmsg.Bytes, fmsg.Packets, net.IP(fmsg.RouterAddr), net.IP(fmsg.NextHop), fmsg.NextHopAS, 
-		fmsg.SrcAS, fmsg.DstAS, fmsg.SrcNet, fmsg.DstNet, fmsg.SrcIf, fmsg.DstIf, fmsg.Proto, 
-		fmsg.SrcPort, fmsg.DstPort, fmsg.IPTos, fmsg.ForwardingStatus, fmsg.IPTTL, fmsg.TCPFlags, 
-		fmsg.SrcMac, fmsg.DstMac, fmsg.VlanId, fmsg.Etype, fmsg.IcmpType, fmsg.IcmpCode, 
+	s := fmt.Sprintf("Type:%v TimeRecvd:%v SamplingRate:%v SequenceNum:%v TimeFlow:%v "+
+		"SrcIP:%v DstIP:%v IPversion:%v Bytes:%v Packets:%v RouterAddr:%v NextHop:%v NextHopAS:%v "+
+		"SrcAS:%v DstAS:%v SrcNet:%v DstNet:%v SrcIf:%v DstIf:%v Proto:%v "+
+		"SrcPort:%v DstPort:%v IPTos:%v ForwardingStatus:%v IPTTL:%v TCPFlags:%v "+
+		"SrcMac:%v DstMac:%v VlanId:%v Etype:%v IcmpType:%v IcmpCode:%v "+
+		"SrcVlan:%v DstVlan:%v IPv6FlowLabel:%v",
+		fmsg.Type, fmsg.TimeRecvd, fmsg.SamplingRate, fmsg.SequenceNum, fmsg.TimeFlow,
+		net.IP(fmsg.SrcIP), net.IP(fmsg.DstIP), fmsg.IPversion, fmsg.Bytes, fmsg.Packets, net.IP(fmsg.RouterAddr), net.IP(fmsg.NextHop), fmsg.NextHopAS,
+		fmsg.SrcAS, fmsg.DstAS, fmsg.SrcNet, fmsg.DstNet, fmsg.SrcIf, fmsg.DstIf, fmsg.Proto,
+		fmsg.SrcPort, fmsg.DstPort, fmsg.IPTos, fmsg.ForwardingStatus, fmsg.IPTTL, fmsg.TCPFlags,
+		fmsg.SrcMac, fmsg.DstMac, fmsg.VlanId, fmsg.Etype, fmsg.IcmpType, fmsg.IcmpCode,
 		fmsg.SrcVlan, fmsg.DstVlan, fmsg.IPv6FlowLabel)
 	return s
 }
 
+func (s *state) lookupAddr(ipStr string) string {
+	hostnames, err := net.LookupAddr(ipStr)
+	var hostname string
+	if err != nil {
+		log.Warnf("Cannot resolve %s: %s", ipStr, err)
+		hostname = ipStr
+	} else {
+		sort.Strings(hostnames)
+		hostname = hostnames[len(hostnames)-1]
+	}
+	return hostname
+}
+
+func (s *state) makeLabels(ip *net.IP, proto uint32) *prometheus.Labels {
+	ipStr := ip.String()
+	cached, err := s.cache.Get(ipStr)
+	var hostname string
+	if err != nil {
+		hostname = s.lookupAddr(ipStr)
+		s.cache.Set(ipStr, []byte(hostname))
+	} else {
+		hostname = string(cached)
+	}
+	return &prometheus.Labels{
+		"ip":       ipStr,
+		"hostname": hostname,
+		"proto":    fmt.Sprint(proto),
+	}
+}
+
 func (s *state) produceFlow(fmsgset []*flowmessage.FlowMessage) {
 	for _, fmsg := range fmsgset {
-		if s.kafkaEn {
-			s.kafkaState.SendKafkaFlowMessage(fmsg)
+		dstIp := net.IP(fmsg.DstIP)
+		srcIp := net.IP(fmsg.SrcIP)
+		if HostsNetwork.Contains(dstIp) {
+			labels := s.makeLabels(&dstIp, fmsg.Proto)
+			MetricHostTrafficRecvBytes.With(*labels).Add(float64(fmsg.Bytes))
+		} else {
+			log.Debugf("Dst addr %s is not in %s", dstIp, HostsNetwork)
+		}
+		if HostsNetwork.Contains(srcIp) {
+			labels := s.makeLabels(&srcIp, fmsg.Proto)
+			MetricHostTrafficSendBytes.With(*labels).Add(float64(fmsg.Bytes))
+		} else {
+			log.Debugf("Src addr %s is not in %s", srcIp, HostsNetwork)
 		}
 		if s.debug {
 			log.Debug(FlowMessageToString(fmsg))
@@ -626,15 +698,13 @@ func (s *state) accountCallback(name string, id int, start, end time.Time) {
 }
 
 type state struct {
-	kafkaState *transport.KafkaState
-	kafkaEn    bool
-
 	templateslock *sync.RWMutex
 	templates     map[string]*TemplateSystem
 
 	samplinglock *sync.RWMutex
 	sampling     map[string]producer.SamplingRateSystem
 
+	cache bigcache.BigCache
 	debug bool
 
 	fworkers int
@@ -752,25 +822,16 @@ func main() {
 		"sFlow":   *SEnable}).
 		Info("Starting GoFlow")
 
+	c, _ := bigcache.NewBigCache(bigcache.DefaultConfig(5 * time.Minute))
+
 	s := &state{
 		fworkers: *FWorkers,
 		sworkers: *SWorkers,
+		cache:    *c,
 	}
 
 	if *LogLevel == "debug" {
 		s.debug = true
-	}
-
-	if *EnableKafka {
-		addrs := make([]string, 0)
-		if *KafkaSrv != "" {
-			addrs, _ = GetServiceAddresses(*KafkaSrv)
-		} else {
-			addrs = strings.Split(*KafkaBrk, ",")
-		}
-		kafkaState := transport.StartKafkaProducer(addrs, *KafkaTopic, *KafkaTLS, *KafkaSASL)
-		s.kafkaState = kafkaState
-		s.kafkaEn = true
 	}
 
 	if *FEnable {
